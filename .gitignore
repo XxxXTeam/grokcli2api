@@ -1,0 +1,23 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Project env / secrets
+.env
+.env.local
+
+# Local config / data
+data/
+*.log
+
+*.exe
+*.i64
+ANALYZE_REPORT.md
+ARCHITECTURE.md
