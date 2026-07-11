@@ -82,6 +82,21 @@ class Settings(BaseSettings):
     # ``httpx.Proxy(excludes=...)`` machinery.
     grok_no_proxy: Optional[str] = Field(default=None, alias="GROK_NO_PROXY")
 
+    # ---- Server-side API key gate (optional) ----
+    # Comma-separated list of accepted ``Authorization: Bearer <key>`` values
+    # for the local GrokCli2API HTTP endpoint. Empty / unset == no gate
+    # (backward compatible: anyone can talk to ``/v1/*`` without a key).
+    # Multiple keys are allowed so you can mint separate credentials for
+    # different clients without restarting the server.
+    #
+    # OpenAI-compat: the standard OpenAI Python / JS / curl clients pass
+    # ``Authorization: Bearer <api_key>`` automatically, so no client-side
+    # configuration is needed beyond setting ``api_key`` at construction.
+    #
+    # Azure-style ``api-key:`` header is also accepted.
+    grok_api_keys: Optional[str] = Field(default=None, alias="GROK_API_KEYS")
+    grok_api_key: Optional[str] = Field(default=None, alias="GROK_API_KEY")
+
     # Derived aliases for ergonomic accessors
     @property
     def host(self) -> str:
@@ -128,11 +143,35 @@ class Settings(BaseSettings):
             return None
         return [p.strip() for p in self.grok_no_proxy.split(",") if p.strip()]
 
+    @property
+    def api_keys(self) -> list[str]:
+        """Accepted bearer tokens for the local GrokCli2API gate.
+
+        Combines ``GROK_API_KEYS`` and ``GROK_API_KEY`` (legacy single-key
+        alias). Empty list means the gate is disabled -- every ``/v1/*``
+        request is treated as authenticated.
+        """
+
+        out: list[str] = []
+        for raw in (self.grok_api_keys, self.grok_api_key):
+            if not raw:
+                continue
+            for key in raw.split(","):
+                key = key.strip()
+                if key and key not in out:
+                    out.append(key)
+        return out
+
+    @property
+    def is_api_key_gate_enabled(self) -> bool:
+        return bool(self.api_keys)
+
     def describe(self) -> str:
         proxy = self.grok_proxy_url or "env(default)"
+        gate = "yes" if self.is_api_key_gate_enabled else "off"
         return (
             f"Settings(host={self.host!r}, port={self.port}, "
             f"chat_proxy={self.chat_proxy_base_url!r}, "
             f"auth={'token' if self.session_token else 'file' if self.auth_file else 'none'}, "
-            f"proxy={proxy!r})"
+            f"proxy={proxy!r}, api_key_gate={gate})"
         )

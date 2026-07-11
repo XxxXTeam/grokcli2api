@@ -4,6 +4,13 @@ Each handler uses :class:`GrokConverter` to translate, then talks to the
 underlying :class:`GrokClient`. Streaming responses are emitted with the
 proper ``text/event-stream`` content-type and ``[DONE]`` terminator so any
 OpenAI SDK (Python / JS / curl / LangChain / etc.) accepts them unchanged.
+
+A second layer of access control sits in front of the OpenAI surface:
+whenever ``GROK_API_KEYS`` is non-empty in the active :class:`Settings`,
+the protected routes require ``Authorization: Bearer <key>`` (or Azure-style
+``Api-Key:``) and reject with ``401`` otherwise. The dependency only fires
+when keys are configured, so leaving the env var unset preserves the old
+behaviour of an open endpoint.
 """
 
 from __future__ import annotations
@@ -13,9 +20,12 @@ import time
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from grokcli2api.auth.api_key import (
+    api_key_dependency,
+)
 from grokcli2api.auth.providers import (
     AuthFileProvider,
     OAuthProvider,
@@ -129,12 +139,29 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     )
     app.state.settings = settings
     _register_routes(app)
+    # Mount the API-key-guarded router last so its dependencies win over
+    # anything mounted earlier with the same path.
+    app.include_router(_protected_router())
     return app
 
 
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
+
+def _protected_router() -> APIRouter:
+    """Build a sub-router that requires ``Authorization: Bearer <key>`` if
+    ``GROK_API_KEYS`` is configured.
+
+    Routes mounted on this router are completely unaffected when the gate is
+    disabled (the dependency becomes a no-op), so this is a no-op for
+    existing deployments that don't set ``GROK_API_KEYS``.
+    """
+
+    router = APIRouter(dependencies=[Depends(api_key_dependency())])
+    _register_protected_routes(router)
+    return router
 
 
 def _register_routes(app: FastAPI) -> None:
@@ -181,9 +208,35 @@ def _register_routes(app: FastAPI) -> None:
 
     # ---- auth management ------------------------------------------------
 
-    @app.post("/v1/auth/refresh")
-    async def auth_refresh() -> dict[str, Any]:
-        session = await app.state.session_store.force_refresh()
+    @app.get("/v1/auth/api-key")
+    async def auth_api_key_status() -> dict[str, Any]:
+        """Tell the operator whether the local API-key gate is on or off.
+
+        Reachable without a key -- this is the introspection path. Do not
+        expose the actual key material, just whether the gate is enabled and
+        how many keys are configured.
+        """
+
+        settings: Settings = app.state.settings
+        return {
+            "enabled": settings.is_api_key_gate_enabled,
+            "key_count": len(settings.api_keys),
+        }
+
+    # Everything below is registered on a separate router that carries the
+    # ``require_api_key`` dependency -- ``mount_protected_router`` wires it
+    # in below.
+    pass
+
+
+def _register_protected_routes(router: APIRouter) -> None:
+    """Register chat + sideband routes. All routes in this router get the
+    ``require_api_key`` dependency attached at router level.
+    """
+
+    @router.post("/v1/auth/refresh")
+    async def auth_refresh(request: Request) -> dict[str, Any]:
+        session = await request.app.state.session_store.force_refresh()
         return {
             "expires_at": session.expires_at,
             "obtained_at": session.obtained_at,
@@ -191,9 +244,9 @@ def _register_routes(app: FastAPI) -> None:
             "user_id": session.user_id,
         }
 
-    @app.get("/v1/auth/status")
-    async def auth_status() -> dict[str, Any]:
-        session = await app.state.session_store.current()
+    @router.get("/v1/auth/status")
+    async def auth_status(request: Request) -> dict[str, Any]:
+        session = await request.app.state.session_store.current()
         return {
             "surface": session.surface,
             "user_id": session.user_id,
@@ -201,12 +254,10 @@ def _register_routes(app: FastAPI) -> None:
             "expires_at": session.expires_at,
         }
 
-    # ---- chat completions -----------------------------------------------
-
-    @app.post("/v1/chat/completions")
-    async def chat_completions(body: ChatCompletionRequest) -> Any:
-        converter: GrokConverter = app.state.converter
-        grok: GrokClient = app.state.grok_client
+    @router.post("/v1/chat/completions")
+    async def chat_completions(request: Request, body: ChatCompletionRequest) -> Any:
+        converter: GrokConverter = request.app.state.converter
+        grok: GrokClient = request.app.state.grok_client
 
         wire_body = converter.prepare_request(body)
         fallback_model = body.model or "grok-build"
@@ -231,7 +282,6 @@ def _register_routes(app: FastAPI) -> None:
 
         async def _stream() -> AsyncIterator[bytes]:
             try:
-                # Initial role chunk so SSE consumers don't see empty stream.
                 leading = {
                     "id": "",
                     "object": "chat.completion.chunk",
@@ -263,16 +313,10 @@ def _register_routes(app: FastAPI) -> None:
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    # -------------------------------------------------------------------
-    # /v1/responses -- primary Chat Completions endpoint per the official CLI.
-    # Translates the OpenAI chat-completions payload to the upstream's
-    # Responses schema and proxies the call directly.
-    # -------------------------------------------------------------------
-
-    @app.post("/v1/responses")
-    async def responses_endpoint(body: ChatCompletionRequest) -> Any:
-        converter: GrokConverter = app.state.converter
-        grok: GrokClient = app.state.grok_client
+    @router.post("/v1/responses")
+    async def responses_endpoint(request: Request, body: ChatCompletionRequest) -> Any:
+        converter: GrokConverter = request.app.state.converter
+        grok: GrokClient = request.app.state.grok_client
 
         wire_body = converter.prepare_responses_body(body)
         fallback_model = body.model or "grok-build"
@@ -293,9 +337,6 @@ def _register_routes(app: FastAPI) -> None:
                 return _grok_error_response(exc)
             except AuthError as exc:
                 return _auth_error_response(exc)
-            # /v1/responses shape is not OpenAI chat-completions -- pass it
-            # through with minimal coercion so OpenAI clients expecting the
-            # legacy shape can still parse it.
             return converter.parse_non_stream(
                 {**upstream, "model": upstream.get("model") or fallback_model},
                 fallback_model=fallback_model,
@@ -323,57 +364,60 @@ def _register_routes(app: FastAPI) -> None:
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    # -------------------------------------------------------------------
-    # Sideband diagnostics proxied from the official CLI.
-    # -------------------------------------------------------------------
-
-    @app.get("/v1/grok/settings")
-    async def grok_settings() -> dict[str, Any]:
+    @router.get("/v1/grok/settings")
+    async def grok_settings(request: Request) -> dict[str, Any]:
         try:
-            return dict(await app.state.grok_client.get_settings())
+            return dict(await request.app.state.grok_client.get_settings())
         except GrokAPIError as exc:
             return _grok_error_response(exc).body  # type: ignore[union-attr]
         except AuthError as exc:
             return _auth_error_response(exc).body  # type: ignore[union-attr]
 
-    @app.get("/v1/grok/user")
-    async def grok_user() -> dict[str, Any]:
+    @router.get("/v1/grok/user")
+    async def grok_user(request: Request) -> dict[str, Any]:
         try:
-            return dict(await app.state.grok_client.get_user())
+            return dict(await request.app.state.grok_client.get_user())
         except GrokAPIError as exc:
             return _grok_error_response(exc).body  # type: ignore[union-attr]
         except AuthError as exc:
             return _auth_error_response(exc).body  # type: ignore[union-attr]
 
-    @app.get("/v1/grok/billing")
-    async def grok_billing() -> dict[str, Any]:
+    @router.get("/v1/grok/billing")
+    async def grok_billing(request: Request) -> dict[str, Any]:
         try:
-            return dict(await app.state.grok_client.get_billing())
+            return dict(await request.app.state.grok_client.get_billing())
         except GrokAPIError as exc:
             return _grok_error_response(exc).body  # type: ignore[union-attr]
         except AuthError as exc:
             return _auth_error_response(exc).body  # type: ignore[union-attr]
 
-    @app.get("/v1/grok/mcp/configs")
-    async def grok_mcp_configs() -> dict[str, Any]:
+    @router.get("/v1/grok/mcp/configs")
+    async def grok_mcp_configs(request: Request) -> dict[str, Any]:
         try:
-            return dict(await app.state.grok_client.get_mcp_configs())
+            return dict(await request.app.state.grok_client.get_mcp_configs())
         except GrokAPIError as exc:
             return _grok_error_response(exc).body  # type: ignore[union-attr]
+        except AuthError as exc:
+            return _auth_error_response(exc).body  # type: ignore[union-attr]
 
-    @app.get("/v1/grok/mcp/tools/list")
-    async def grok_mcp_tools_list() -> dict[str, Any]:
+    @router.get("/v1/grok/mcp/tools/list")
+    async def grok_mcp_tools_list(request: Request) -> dict[str, Any]:
         try:
-            return dict(await app.state.grok_client.list_mcp_tools())
+            return dict(await request.app.state.grok_client.list_mcp_tools())
         except GrokAPIError as exc:
             return _grok_error_response(exc).body  # type: ignore[union-attr]
+        except AuthError as exc:
+            return _auth_error_response(exc).body  # type: ignore[union-attr]
 
-    @app.get("/v1/grok/feedback/config")
-    async def grok_feedback_config() -> dict[str, Any]:
+    @router.get("/v1/grok/feedback/config")
+    async def grok_feedback_config(request: Request) -> dict[str, Any]:
         try:
-            return dict(await app.state.grok_client.get_feedback_config())
+            return dict(await request.app.state.grok_client.get_feedback_config())
         except GrokAPIError as exc:
-            return _grok_error_response(exc).body  # type: ignore[union-attr] ## end sideband
+            return _grok_error_response(exc).body  # type: ignore[union-attr]
+        except AuthError as exc:
+            return _auth_error_response(exc).body  # type: ignore[union-attr]
+
 
 
 

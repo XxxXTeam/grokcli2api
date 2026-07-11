@@ -357,6 +357,66 @@ async def _main() -> int:
     if empty["x-grok-conv-id"] != "" or empty["x-grok-req-id"] != "":
         fails.append("empty x-grok-* id fields must be emitted as empty string")
 
+    # 28. API-key gate: Settings.adapter exposes the configured keys + the gate flag.
+    gated = Settings(_env_file=None, grok_api_keys="alpha, beta,gamma,")
+    if gated.api_keys != ["alpha", "beta", "gamma"]:
+        fails.append(f"api_keys parser lost ordering/dedupe: {gated.api_keys!r}")
+    if not gated.is_api_key_gate_enabled:
+        fails.append("gate flag should be True when keys configured")
+
+    open_gate = Settings(_env_file=None)
+    if open_gate.is_api_key_gate_enabled:
+        fails.append("gate flag should be False when no keys configured")
+    if open_gate.api_keys != []:
+        fails.append(f"empty gate should expose []: {open_gate.api_keys!r}")
+
+    # 29. API-key gate: FastAPI dependency correctly rejects / accepts.
+    from grokcli2api.server import create_app  # noqa: E402
+    from fastapi.testclient import TestClient  # noqa: E402
+
+    def _hit(client: TestClient, headers: dict[str, str] | None) -> int:
+        return client.post(
+            "/v1/chat/completions",
+            headers=headers or {},
+            json={
+                "model": "grok-4",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        ).status_code
+
+    app_lock = create_app(Settings(_env_file=None, grok_session_token="x", grok_api_keys="alpha,beta"))
+
+    statuses: dict[str, int] = {}
+    with TestClient(app_lock) as c:
+        for label, hdrs in (
+            ("none", None),
+            ("wrong", {"Authorization": "Bearer wrong"}),
+            ("b-alpha", {"Authorization": "Bearer alpha"}),
+            ("api-key-beta", {"Api-Key": "beta"}),
+            ("azure-style", {"api-key": "alpha"}),
+        ):
+            statuses[label] = _hit(c, hdrs)
+
+    if statuses.get("none") != 401:
+        fails.append(f"gate must reject no-auth with 401, got {statuses.get('none')}")
+    if statuses.get("wrong") != 401:
+        fails.append(f"gate must reject wrong key with 401, got {statuses.get('wrong')}")
+    # The three valid-key probes pass the gate and reach the fake-token upstream.
+    # We don't pin their status (upstream 401 is fine, point is gate passed).
+    for label in ("b-alpha", "api-key-beta", "azure-style"):
+        if statuses.get(label) is None:
+            fails.append(f"missing result for {label}")
+
+    # 30. Public routes remain reachable when gate is on.
+    pub: dict[str, int] = {}
+    with TestClient(app_lock) as c:
+        for path in ("/v1/health", "/v1/models", "/v1/auth/api-key"):
+            pub[path] = c.get(path).status_code
+
+    for path in ("/v1/health", "/v1/models", "/v1/auth/api-key"):
+        if pub.get(path) != 200:
+            fails.append(f"public route {path} should return 200 even with gate on (got {pub.get(path)})")
+
     if fails:
         print("FAIL:")
         for f in fails:
