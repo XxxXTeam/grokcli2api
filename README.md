@@ -188,6 +188,4 @@ grokcli2api/
 
 ## License & disclaimer
 
-This project is MIT-licensed. It is an independent, clean-room
-re-implementation based on the public behavior of `grok.exe` and the OpenAI
-HTTP API spec. Use it at your own risk; respect xAI's terms of service.
+AGPL3
