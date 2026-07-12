@@ -161,6 +161,7 @@ class GrokClient:
         session_store: SessionStore,
         timeout_seconds: float = 90.0,
         http2: bool = True,
+        transport: Optional[httpx.AsyncBaseTransport] = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._version = version.strip("/")
@@ -174,14 +175,14 @@ class GrokClient:
             settings.no_proxy_patterns or "[]",
         )
 
-        self._client = httpx.AsyncClient(
-            base_url=self._base_url,
-            http2=http2,
-            proxy=proxy,
-            timeout=httpx.Timeout(timeout_seconds, connect=10.0, read=timeout_seconds, write=30.0),
-            verify=not settings.grok_tls_insecure_skip_verify,
-            follow_redirects=False,
-            headers={
+        client_kwargs: dict[str, Any] = {
+            "base_url": self._base_url,
+            "http2": http2,
+            "proxy": proxy,
+            "timeout": httpx.Timeout(timeout_seconds, connect=10.0, read=timeout_seconds, write=30.0),
+            "verify": not settings.grok_tls_insecure_skip_verify,
+            "follow_redirects": False,
+            "headers": {
                 "accept-encoding": "gzip, br",
                 # default User-Agent echoes the official compound form; some
                 # paths override with the single-component chat variant.
@@ -190,7 +191,10 @@ class GrokClient:
                     settings.grok_client_version,
                 ),
             },
-        )
+        }
+        if transport is not None:
+            client_kwargs["transport"] = transport
+        self._client = httpx.AsyncClient(**client_kwargs)
 
         # Stable ids reused across turns so the upstream sees a coherent session.
         self._agent_id = new_agent_id()
@@ -289,25 +293,130 @@ class GrokClient:
         path = "/".join(p.strip("/") for p in (self._version, *parts) if p)
         return f"/{path}"
 
+    # ---- low-level request helpers with 401 refresh -----------------------
+
+    async def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        assemble: bool = False,
+        assemble_kwargs: Optional[Mapping[str, Any]] = None,
+        extra_headers: Optional[Mapping[str, str]] = None,
+        **httpx_kwargs: Any,
+    ) -> httpx.Response:
+        """Execute a non-streaming request, refreshing auth and retrying once on 401."""
+
+        async def _make() -> httpx.Response:
+            if assemble:
+                headers = await self._assemble_headers(**dict(assemble_kwargs or {}))
+                if extra_headers:
+                    headers.update(extra_headers)
+                httpx_kwargs["headers"] = headers
+            return await self._client.request(method, url, **httpx_kwargs)
+
+        resp = await _make()
+        if resp.status_code == 401:
+            log.warning("upstream returned 401, refreshing session and retrying once")
+            await self._session_store.refresh()
+            resp = await _make()
+        return resp
+
+    @asynccontextmanager
+    async def _stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        assemble: bool = False,
+        assemble_kwargs: Optional[Mapping[str, Any]] = None,
+        extra_headers: Optional[Mapping[str, str]] = None,
+        **httpx_kwargs: Any,
+    ) -> AsyncIterator[httpx.Response]:
+        """Open a streaming request, refreshing auth and retrying once on 401."""
+
+        async def _make() -> Any:
+            if assemble:
+                headers = await self._assemble_headers(**dict(assemble_kwargs or {}))
+                if extra_headers:
+                    headers.update(extra_headers)
+                httpx_kwargs["headers"] = headers
+            return self._client.stream(method, url, **httpx_kwargs)
+
+        cm = await _make()
+        async with cm as resp:
+            if resp.status_code == 401:
+                log.warning("upstream returned 401 on stream, refreshing session and retrying once")
+                await self._session_store.refresh()
+                cm = await _make()
+                async with cm as resp:
+                    yield resp
+                    return
+            yield resp
+
+    async def _check_stream_status(
+        self,
+        resp: httpx.Response,
+        req_id: Optional[str] = None,
+    ) -> None:
+        """Raise :class:`GrokAPIError` for a non-OK streaming response."""
+
+        if resp.status_code >= 400:
+            body_text = await resp.aread()
+            raise GrokAPIError(
+                status=resp.status_code,
+                body=body_text.decode("utf-8", "replace"),
+                request_id=req_id,
+            )
+
+    async def _iter_sse(
+        self,
+        resp: httpx.Response,
+        req_id: Optional[str] = None,
+    ) -> AsyncIterator[Mapping[str, Any]]:
+        """Yield parsed SSE ``data:`` payloads from a streaming response."""
+
+        async for raw in resp.aiter_lines():
+            line = raw.strip()
+            if not line or not line.startswith("data:"):
+                continue
+            payload = line[len("data:"):].strip()
+            if not payload or payload == "[DONE]":
+                if payload == "[DONE]":
+                    return
+                continue
+            try:
+                yield json.loads(payload)
+            except json.JSONDecodeError:
+                log.warning("malformed SSE chunk: %r", payload)
+                continue
+
     # ---- primary: chat completions ----------------------------------------
 
     async def health(self) -> Mapping[str, Any]:
-        headers = await self._assemble_headers()
-        resp = await self._client.get(self._build_url("models"), headers=headers)
-        return self._check(resp)
+        return self._check(await self._request(
+            "GET",
+            self._build_url("models"),
+            assemble=True,
+        ))
 
     async def list_models(self) -> Mapping[str, Any]:
-        headers = await self._assemble_headers()
-        resp = await self._client.get(self._build_url("models"), headers=headers)
-        return self._check(resp)
+        return self._check(await self._request(
+            "GET",
+            self._build_url("models"),
+            assemble=True,
+        ))
 
     async def chat(self, body: Mapping[str, Any], *, conv_id: Optional[str] = None) -> Mapping[str, Any]:
         """POST /{v1}/chat/completions -- non-streaming."""
 
-        headers = await self._assemble_headers(conv_id=conv_id, model_override=body.get("model"))
-        url = self._build_url("chat/completions")
-        resp = await self._client.post(url, headers=headers, json=body)
-        return self._check(resp)
+        return self._check(await self._request(
+            "POST",
+            self._build_url("chat/completions"),
+            assemble=True,
+            assemble_kwargs={"conv_id": conv_id, "model_override": body.get("model")},
+            json=body,
+        ))
 
     async def stream_chat(
         self,
@@ -317,35 +426,21 @@ class GrokClient:
     ) -> AsyncIterator[Mapping[str, Any]]:
         """POST /{v1}/chat/completions with ``stream=true`` (SSE)."""
 
-        headers = await self._assemble_headers(conv_id=conv_id, model_override=body.get("model"))
-        headers["accept"] = "text/event-stream"
         url = self._build_url("chat/completions")
-        req_id = headers.get("x-grok-req-id")
-        log.debug("streaming chat request", extra={"url": url, "req_id": req_id})
+        log.debug("streaming chat request", extra={"url": url})
 
-        async with self._client.stream("POST", url, headers=headers, json=body) as resp:
-            if resp.status_code >= 400:
-                body_text = await resp.aread()
-                raise GrokAPIError(
-                    status=resp.status_code,
-                    body=body_text.decode("utf-8", "replace"),
-                    request_id=req_id,
-                )
-
-            async for raw in resp.aiter_lines():
-                line = raw.strip()
-                if not line or not line.startswith("data:"):
-                    continue
-                payload = line[len("data:"):].strip()
-                if not payload or payload == "[DONE]":
-                    if payload == "[DONE]":
-                        return
-                    continue
-                try:
-                    yield json.loads(payload)
-                except json.JSONDecodeError:
-                    log.warning("malformed SSE chunk: %r", payload)
-                    continue
+        async with self._stream(
+            "POST",
+            url,
+            assemble=True,
+            assemble_kwargs={"conv_id": conv_id, "model_override": body.get("model")},
+            extra_headers={"accept": "text/event-stream"},
+            json=body,
+        ) as resp:
+            req_id = resp.request.headers.get("x-grok-req-id") if resp.request else None
+            await self._check_stream_status(resp, req_id)
+            async for chunk in self._iter_sse(resp, req_id):
+                yield chunk
 
     # ---- primary: responses API -------------------------------------------
 
@@ -374,18 +469,21 @@ class GrokClient:
             }
         """
 
-        headers = await self._assemble_headers(
-            conv_id=conv_id,
-            model_override=body.get("model"),
-            user_agent=chat_user_agent(
-                self._settings.grok_client_identifier,
-                self._settings.grok_client_version,
-            ),
-            with_traceparent=True,
-        )
-        url = self._build_url("responses")
-        resp = await self._client.post(url, headers=headers, json=body)
-        return self._check(resp)
+        return self._check(await self._request(
+            "POST",
+            self._build_url("responses"),
+            assemble=True,
+            assemble_kwargs={
+                "conv_id": conv_id,
+                "model_override": body.get("model"),
+                "user_agent": chat_user_agent(
+                    self._settings.grok_client_identifier,
+                    self._settings.grok_client_version,
+                ),
+                "with_traceparent": True,
+            },
+            json=body,
+        ))
 
     async def stream_responses(
         self,
@@ -395,87 +493,84 @@ class GrokClient:
     ) -> AsyncIterator[Mapping[str, Any]]:
         """POST /{v1}/responses with ``stream=true`` (SSE)."""
 
-        headers = await self._assemble_headers(
-            conv_id=conv_id,
-            model_override=body.get("model"),
-            user_agent=chat_user_agent(
-                self._settings.grok_client_identifier,
-                self._settings.grok_client_version,
-            ),
-            with_traceparent=True,
-        )
-        headers["accept"] = "text/event-stream"
-        url = self._build_url("responses")
-
-        async with self._client.stream("POST", url, headers=headers, json=body) as resp:
-            if resp.status_code >= 400:
-                body_text = await resp.aread()
-                raise GrokAPIError(
-                    status=resp.status_code,
-                    body=body_text.decode("utf-8", "replace"),
-                    request_id=headers.get("x-grok-req-id"),
-                )
-
-            async for raw in resp.aiter_lines():
-                line = raw.strip()
-                if not line or not line.startswith("data:"):
-                    continue
-                payload = line[len("data:"):].strip()
-                if not payload or payload == "[DONE]":
-                    if payload == "[DONE]":
-                        return
-                    continue
-                try:
-                    yield json.loads(payload)
-                except json.JSONDecodeError:
-                    log.warning("malformed SSE chunk: %r", payload)
-                    continue
+        async with self._stream(
+            "POST",
+            self._build_url("responses"),
+            assemble=True,
+            assemble_kwargs={
+                "conv_id": conv_id,
+                "model_override": body.get("model"),
+                "user_agent": chat_user_agent(
+                    self._settings.grok_client_identifier,
+                    self._settings.grok_client_version,
+                ),
+                "with_traceparent": True,
+            },
+            extra_headers={"accept": "text/event-stream"},
+            json=body,
+        ) as resp:
+            req_id = resp.request.headers.get("x-grok-req-id") if resp.request else None
+            await self._check_stream_status(resp, req_id)
+            async for chunk in self._iter_sse(resp, req_id):
+                yield chunk
 
     # ---- sideband: settings / user / billing / mcp / feedback ---------------
 
     async def get_settings(self) -> Mapping[str, Any]:
         """GET /{v1}/settings -- returns ``min_client_version``, ``force_update``, etc."""
 
-        headers = await self._assemble_headers(with_traceparent=False)
-        resp = await self._client.get(self._build_url("settings"), headers=headers)
-        return self._check(resp)
+        return self._check(await self._request(
+            "GET",
+            self._build_url("settings"),
+            assemble=True,
+            assemble_kwargs={"with_traceparent": False},
+        ))
 
     async def get_user(self, *, include: str = "subscription") -> Mapping[str, Any]:
         """GET /{v1}/user?include=... -- profile, email, blocking reasons."""
 
-        headers = await self._assemble_headers()
-        url = self._build_url("user") + f"?include={include}"
-        resp = await self._client.get(url, headers=headers)
-        return self._check(resp)
+        return self._check(await self._request(
+            "GET",
+            self._build_url("user") + f"?include={include}",
+            assemble=True,
+        ))
 
     async def get_billing(self, *, format_: str = "credits") -> Mapping[str, Any]:
         """GET /{v1}/billing?format=credits -- usage / prepaid balance."""
 
-        headers = await self._assemble_headers()
-        url = self._build_url("billing") + f"?format={format_}"
-        resp = await self._client.get(url, headers=headers)
-        return self._check(resp)
+        return self._check(await self._request(
+            "GET",
+            self._build_url("billing") + f"?format={format_}",
+            assemble=True,
+        ))
 
     async def get_mcp_configs(self) -> Mapping[str, Any]:
         """GET /{v1}/mcp/configs -- user-configured MCP servers."""
 
-        headers = await self._assemble_headers()
-        resp = await self._client.get(self._build_url("mcp/configs"), headers=headers)
-        return self._check(resp)
+        return self._check(await self._request(
+            "GET",
+            self._build_url("mcp/configs"),
+            assemble=True,
+        ))
 
     async def list_mcp_tools(self) -> Mapping[str, Any]:
         """GET /{v1}/mcp/tools/list -- catalog of available MCP tools."""
 
-        headers = await self._assemble_headers()
-        resp = await self._client.get(self._build_url("mcp/tools/list"), headers=headers)
-        return self._check(resp)
+        return self._check(await self._request(
+            "GET",
+            self._build_url("mcp/tools/list"),
+            assemble=True,
+        ))
 
     async def get_feedback_config(self) -> Mapping[str, Any]:
         """GET /{v1}/feedback/config -- A/B feedback sampling config."""
 
-        headers = await self._assemble_headers(with_traceparent=True)
-        resp = await self._client.get(self._build_url("feedback/config"), headers=headers)
-        return self._check(resp)
+        return self._check(await self._request(
+            "GET",
+            self._build_url("feedback/config"),
+            assemble=True,
+            assemble_kwargs={"with_traceparent": True},
+        ))
 
     # ---- sideband: sessions lifecycle --------------------------------------
 
@@ -498,34 +593,43 @@ class GrokClient:
             "hostname": hostname_value or hostname_of(),
             "deviceId": device_id,
         }
-        headers = await self._assemble_headers()
-        resp = await self._client.post(self._build_url("sessions/register"), headers=headers, json=payload)
-        return self._check(resp)
+        return self._check(await self._request(
+            "POST",
+            self._build_url("sessions/register"),
+            assemble=True,
+            json=payload,
+        ))
 
     async def session_replicas_update(self, session_id: str, summary: str) -> Mapping[str, Any]:
         """POST /{v1}/sessions/<id>/replicas/update -- bulk-update session snapshot."""
 
-        headers = await self._assemble_headers()
-        url = f"{self._build_url('sessions', session_id, 'replicas/update')}"
-        body = {"summary": summary}
-        resp = await self._client.post(url, headers=headers, json=body)
-        return self._check(resp)
+        return self._check(await self._request(
+            "POST",
+            self._build_url("sessions", session_id, "replicas/update"),
+            assemble=True,
+            json={"summary": summary},
+        ))
 
     async def session_signals(self, session_id: str, signals: Mapping[str, Any]) -> Mapping[str, Any]:
         """POST /{v1}/sessions/<id>/signals -- aggregate session telemetry."""
 
-        headers = await self._assemble_headers(with_traceparent=True)
-        url = f"{self._build_url('sessions', session_id, 'signals')}"
-        resp = await self._client.post(url, headers=headers, json=signals)
-        return self._check(resp)
+        return self._check(await self._request(
+            "POST",
+            self._build_url("sessions", session_id, "signals"),
+            assemble=True,
+            assemble_kwargs={"with_traceparent": True},
+            json=signals,
+        ))
 
     async def session_turn_deltas(self, session_id: str, deltas: Mapping[str, Any]) -> Mapping[str, Any]:
         """POST /{v1}/sessions/<id>/turn-deltas -- per-turn telemetry."""
 
-        headers = await self._assemble_headers()
-        url = f"{self._build_url('sessions', session_id, 'turn-deltas')}"
-        resp = await self._client.post(url, headers=headers, json=deltas)
-        return self._check(resp)
+        return self._check(await self._request(
+            "POST",
+            self._build_url("sessions", session_id, "turn-deltas"),
+            assemble=True,
+            json=deltas,
+        ))
 
     # ---- sideband: tracing / log streaming --------------------------------
 
@@ -550,32 +654,36 @@ class GrokClient:
             for chunk in ndjson_chunks:
                 yield chunk
 
-        headers = await self._assemble_headers(
-            extra={"x-storage-path": path},
-            user_agent=default_user_agent(
-                self._settings.grok_client_identifier,
-                self._settings.grok_client_version,
-            ),
-        )
-        resp = await self._client.post(
+        return self._check(await self._request(
+            "POST",
             url,
-            headers={**headers, "content-type": "application/x-ndjson"},
+            assemble=True,
+            assemble_kwargs={
+                "extra": {"x-storage-path": path},
+                "user_agent": default_user_agent(
+                    self._settings.grok_client_identifier,
+                    self._settings.grok_client_version,
+                ),
+            },
+            extra_headers={"content-type": "application/x-ndjson"},
             content=_iter_body(),
-        )
-        return self._check(resp)
+        ))
 
     async def post_traces(self, *, otlp_payload: bytes) -> Mapping[str, Any]:
         """POST /{v1}/traces -- OTLP/protobuf telemetry."""
 
-        headers = await self._assemble_headers(
-            extra={
-                "user-agent": "OTel-OTLP-Exporter-Rust/0.32.0",
-                "content-type": "application/x-protobuf",
+        return self._check(await self._request(
+            "POST",
+            self._build_url("traces"),
+            assemble=True,
+            assemble_kwargs={
+                "extra": {
+                    "user-agent": "OTel-OTLP-Exporter-Rust/0.32.0",
+                    "content-type": "application/x-protobuf",
+                },
             },
-        )
-        url = self._build_url("traces")
-        resp = await self._client.post(url, headers=headers, content=otlp_payload)
-        return self._check(resp)
+            content=otlp_payload,
+        ))
 
     # ---- error handling --------------------------------------------------
 

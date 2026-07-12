@@ -26,6 +26,7 @@ official binary.
 | `GET /v1/models`         | ✅ Static catalog mirroring `cli-chat-proxy.grok.com`         |
 | `POST /v1/auth/refresh`  | ✅ Forces a new session                                      |
 | `GET /v1/auth/status`    | ✅ Inspect current session                                   |
+| Auto-refresh on 401      | ✅ Re-reads `auth.json` / provider refresh and retries once  |
 | `GET /v1/health`         | ✅ Upstream probe                                            |
 | Auth providers           | `SessionToken` · `auth.json` · OAuth (stub)                 |
 | Request passthrough       | Any extra field (`reasoning_effort`, `search`, …) reaches upstream |

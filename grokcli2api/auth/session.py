@@ -64,6 +64,17 @@ class AuthProvider(abc.ABC):
     async def acquire(self) -> Session:
         """Return a session. May involve file IO, network calls, or user prompts."""
 
+    async def refresh(self, current: Session) -> Session:
+        """Refresh an existing session.
+
+        Providers that can exchange a refresh token (or re-read an updated
+        auth file) should override this. The default raises :class:`AuthError`,
+        which tells :class:`SessionStore` to fall back to a fresh
+        :meth:`acquire` call.
+        """
+
+        raise AuthError(f"{type(self).__name__} does not implement token refresh")
+
 
 class SessionStore:
     """Holds a current :class:`Session` and refreshes it on demand."""
@@ -102,6 +113,27 @@ class SessionStore:
         async with self._lock:
             log.warning("forcing session refresh")
             new_session = await self._do_acquire()
+            self._session = new_session
+            return new_session
+
+    async def refresh(self, current: Optional[Session] = None) -> Session:
+        """Refresh the current session, falling back to re-acquire.
+
+        The provider's :meth:`AuthProvider.refresh` is tried first so real
+        OAuth refresh-token flows can be used when available. If the provider
+        does not implement refresh (the default), we fall back to
+        :meth:`force_refresh`, which for :class:`AuthFileProvider` means
+        re-reading ``auth.json`` -- exactly what we need when the official CLI
+        has rotated the bearer token in the background.
+        """
+
+        async with self._lock:
+            log.warning("refreshing session")
+            try:
+                new_session = await self._provider.refresh(current)
+            except AuthError:
+                log.debug("provider.refresh not available, falling back to acquire")
+                new_session = await self._do_acquire()
             self._session = new_session
             return new_session
 
